@@ -1,0 +1,207 @@
+# The go library: Go programs, built from the modules a workspace's `go.sum`
+# names, each fetched by the SHA-256 its `go.pins` records.
+#
+# - `Toolchain::Go`: a Go toolchain, a `GoToolchain`: `root`, the Go
+#   distribution, `bin/go` and the compiler, assembler, linker and the
+#   standard library's sources it builds with; and `runtime`, a root they
+#   run on, with `/bin/sh` and the usual tools. Go's tools are static
+#   programs, so the root needs nothing else of them.
+# - `go_1_26`: Go 1.26.8 from go.dev, pinned by its SHA-256, running on the
+#   buildenv library's pinned busybox environment. Go compiles for any
+#   platform, so it is registered for every one.
+# - `ModuleFile`: a file of a module that `go.sum` names, as `go.pins` pins
+#   it: the module's path and version, its `kind`, `zip` for its files or
+#   `mod` for its `go.mod`, and the SHA-256 of the file the module proxy
+#   serves for it.
+# - `sum_files(sum)`: each file the `go.sum` file `sum` names, in its order,
+#   without its pin.
+# - `pins(file)`: each file the `go.pins` file `file` pins. A line is
+#   `PATH VERSION KIND SHA256`; a blank line or one beginning `#` is left
+#   out.
+# - `proxy(sum, pinned_by)`: the module files `sum` names, each fetched by
+#   the SHA-256 the `go.pins` file `pinned_by` records for it, laid out as a module proxy serves them,
+#   for `GOPROXY=file://...`: `PATH/@v/VERSION.zip` and `.mod`, and an
+#   `.info` beside each `.mod`, the path and version escaped as the proxy
+#   protocol escapes them. A file `sum` names that has no pin is
+#   an error, naming each: run `pin_modules` again. Go checks every file it
+#   reads from the proxy against `sum`, so that the pins name the bytes and
+#   `sum` what they must be.
+# - `pin_modules(sum, out)`: for a script, run with the network: writes the
+#   `go.pins` file `out` for `sum`, each file `sum` names fetched from the
+#   module proxy `proxy`, by default `https://proxy.golang.org`, by the
+#   host's `curl`, and its SHA-256 taken by the host's `sha256sum`.
+#   Review a changed `go.pins` as a changed `go.sum` is reviewed.
+# - `module_zip(pinned, module, version)`: the zip of the module `module`
+#   at `version`, fetched from the module proxy by its pin among `pinned`,
+#   as `pins` reads them; an error if it has none.
+# - `module_source(file)`: the files of a module, its `zip` `file`
+#   unpacked: a directory of `PATH@VERSION`, which holds them.
+# - `escaped(text)`: `text`, a module's path or version, escaped as the
+#   module proxy protocol and a module cache escape it, each upper-case
+#   letter `!` and the letter in lower case.
+#
+# `packages.gcsl` builds a workspace one package at a time: see its
+# `workspace`.
+import fs
+import path
+import unpack from archive
+import Toolchain from toolchain
+import * from "github.com/gcslib/buildenv"
+
+type GoToolchain = {root: Dir, runtime: Dir}
+
+enum Toolchain::Go<GoToolchain>
+
+type ModuleFile = {path: String, version: String, kind: String, sha256: String = ""}
+
+let DL = "https://go.dev/dl"
+
+let PROXY = "https://proxy.golang.org"
+
+def Toolchain::Go go_1_26() {
+    let pinned = (Toolchain::BuildEnv busybox_x86_64)().made()
+    let env: Toolchain = pinned.provides
+    let archive = fetch(
+        "{DL}/go1.26.8.linux-amd64.tar.gz",
+        sha256 = "d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b",
+    )
+    host_platform = {arch = "x86_64"; os = "linux"}
+    platform = {}
+    provides = {
+        root = unpack(archive).dir("go")
+        runtime = Toolchain::BuildEnv.payload(env).root
+    }
+}
+
+# Each file the `go.sum` file `sum` names. Memoised, so that a build reads
+# it once.
+def sum_files(sum: File) ->> List<ModuleFile> {
+    = for line in lines(sum.read()) if trim(line) != "" {
+        let words = fields(line)
+        if len(words) != 3 {
+            panic("`{sum.path}` has a line that is no module's: `{line}`")
+        }
+        let mod = words[1].ends_with("/go.mod")
+        = {path = words[0]; version = words[1].strip_suffix("/go.mod"); kind = if mod { "mod" } else { "zip" }}
+    }
+}
+
+def pins(file: File) ->> List<ModuleFile> {
+    = for line in lines(file.read()) if trim(line) != "" and not trim(line).starts_with("#") {
+        let words = fields(line)
+        if len(words) != 4 or not ["zip", "mod"].contains(words[2]) {
+            panic("`{file.path}` has a line that is no module file's pin: `{line}`")
+        }
+        = {path = words[0]; version = words[1]; kind = words[2]; sha256 = words[3]}
+    }
+}
+
+def proxy(sum: File, pinned_by: File) ->> Dir {
+    let pinned = pins(pinned_by)
+    let named = sum_files(sum)
+    let keys = for each in pinned { = key(each) }
+    let missing = for each in named if not keys.contains(key(each)) { = "`{key(each)}`" }
+    if len(missing) > 0 {
+        panic(
+            "`{pinned_by.path}` pins no file for {missing.join(", ")}, which `{sum.path}` names: run `pin_modules` again",
+        )
+    }
+    let files = for each in named {
+        let pin = pinned_of(pinned, each)
+        = {at = proxy_path(each); place = fetch(proxy_url(PROXY, each), sha256 = pin.sha256)}
+    }
+    let infos = for each in named if each.kind == "mod" {
+        = {at = "{escaped(each.path)}/@v/{escaped(each.version)}.info"; text = "{{\"Version\":\"{each.version}\"}}\n"}
+    }
+    = laid_out(files, infos)
+}
+
+def pin_modules(sum: File, out: String, proxy: String = PROXY) -> Int {
+    let named = sum_files(sum)
+    let found = for each in named {
+        let url = proxy_url(proxy, each)
+        let ran = exec([
+            "sh",
+            "-c",
+            "f=$(mktemp) && curl -fsSL --retry 3 -o \"$f\" \"$1\" && sha256sum \"$f\"; s=$?; rm -f \"$f\"; exit $s",
+            "sh",
+            url,
+        ])
+        = "{each.path} {each.version} {each.kind} {fields(ran.stdout)[0]}"
+    }
+    let wrote = fs.write(
+        out,
+        "# The SHA-256 of each module file go.sum names, as the module proxy\n\
+         # serves it, which pekit fetches it by. Written by gcslib/go's\n\
+         # pin_modules: review a change as a change to go.sum is reviewed.\n\
+         {found.join("\n")}\n",
+    )
+    = len(found)
+}
+
+def module_zip(pinned: List<ModuleFile>, module: String, version: String) -> File {
+    let want: ModuleFile = {path = module; version = version; kind = "zip"}
+    let found = for each in pinned if key(each) == key(want) { = each }
+    if len(found) == 0 {
+        panic("no pin for the module `{module}@{version}`: run `pin_modules` again")
+    }
+    = fetch(proxy_url(PROXY, want), sha256 = found[0].sha256)
+}
+
+def module_source(file: File) -> Dir {
+    = unpack(file)
+}
+
+def escaped(text: String): String {
+    let mut out = text
+    for pair in [
+        ["A", "a"], ["B", "b"], ["C", "c"], ["D", "d"], ["E", "e"], ["F", "f"], ["G", "g"],
+        ["H", "h"], ["I", "i"], ["J", "j"], ["K", "k"], ["L", "l"], ["M", "m"], ["N", "n"],
+        ["O", "o"], ["P", "p"], ["Q", "q"], ["R", "r"], ["S", "s"], ["T", "t"], ["U", "u"],
+        ["V", "v"], ["W", "w"], ["X", "x"], ["Y", "y"], ["Z", "z"],
+    ] {
+        out := out.split(pair[0]).join("!{pair[1]}")
+    }
+    = out
+}
+
+# The pin of `pinned` for the file `each`, which has one.
+fn pinned_of(pinned: List<ModuleFile>, each: ModuleFile) -> ModuleFile {
+    for pin in pinned {
+        if key(pin) == key(each) {
+            return pin
+        }
+    }
+    panic("no pin for `{key(each)}`")
+}
+
+# The module file `each` names, as `PATH VERSION KIND`.
+fn key(each: ModuleFile): String {
+    = "{each.path} {each.version} {each.kind}"
+}
+
+# Where a module proxy serves the file `each`, under its root.
+fn proxy_path(each: ModuleFile): String {
+    = "{escaped(each.path)}/@v/{escaped(each.version)}.{each.kind}"
+}
+
+# The URL of the file `each` on the module proxy `proxy`.
+fn proxy_url(proxy: String, each: ModuleFile): String {
+    = "{proxy}/{proxy_path(each)}"
+}
+
+# `files`, each placed at its path, and a file of each of `infos`' text at
+# its path, as one directory.
+#[hermetic]
+fn laid_out(files: List<{at: String, place: File}>, infos: List<{at: String, text: String}>) -> Dir {
+    let written = for each in infos {
+        let target = "{working_dir().path}/info/{each.at}"
+        let made = fs.mkdir(path.dirname(target))
+        let wrote = fs.write(target, each.text)
+        = {at = each.at; place = file(target)}
+    }
+    = fs.compose([
+        ...(for each in files { = {at = each.at; place = each.place} }),
+        ...(for each in written { = {at = each.at; place = each.place} }),
+    ])
+}

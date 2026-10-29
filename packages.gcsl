@@ -1,0 +1,936 @@
+# Go workspaces built one package at a time: each package a step of its
+# own, as Bazel's rules_go builds them, so that a change rebuilds only the
+# packages it reaches, and two programs share the packages they both use.
+#
+# - `workspace(src, sum, pinned_by)`: the Go module `src`, its modules
+#   fetched as `proxy(sum, pinned_by)` lays them out, built for `goos` and
+#   `goarch`, by default Linux on x86-64, with `cgo` off, as `buildmode`
+#   says, `exe` by default, and with the build tags `tags`: a
+#   `GoWorkspace`. Its standard library is built by the go command, as one
+#   step, for each build mode its programs and tests are built in, and
+#   every package's compile is given it.
+# - `bin(ws, package)`: the program of the main package `package`, a path
+#   of the module's own, `./cmd/tool` say, or `.` for its root, linked with
+#   `ldflags` after the build mode, and named `name`, by default the last
+#   element of its import path. Go plans it: the packages it needs, as
+#   `go list -deps` lists them, and what `go build` embeds in it of the
+#   modules it was built from, as `runtime/debug.ReadBuildInfo` reads it.
+#   Planning reads the module's sources, as Go's does, for their imports:
+#   a change to a source plans again, and rebuilds only the packages whose
+#   files or dependencies changed.
+# - `tests(ws, package)`: the test program of the package `package`, as
+#   `go test -c` builds it, a static program whatever the build mode, as
+#   `go test` links one by default, a `GoTest`, or none for a package with
+#   no test files; `run_test(test)` runs one, a step, in its package's
+#   directory, as `go test` runs it, with `-test.paniconexit0` and a ten-minute
+#   `-test.timeout`, `given` placed at their paths, `env` set and `args`
+#   its arguments after Go's, and fails if it does.
+# - `vet(ws, patterns)`: `go vet` of the packages `patterns` match, by
+#   default every package of the module, as one step, which fails as `go
+#   vet` does.
+# - `race(ws, patterns)`: `go test -race` of the packages `patterns` match,
+#   as one step, with cgo on and the C toolchain `cc` that the race
+#   detector's runtime links with, which fails as `go test` does.
+#
+# Each package is compiled as the go command compiles it, with `-trimpath`:
+# its Go files by `compile`, its assembly by `asm`, first for the symbols
+# its Go files may call and then each file, the objects packed into its
+# archive by `pack`, which the go command's distribution lacks and is built
+# from its source. Each step's sandbox holds the toolchain, the standard
+# library, the package's own files, placed one by one, and the archives of
+# the packages it imports, nothing else. A package is placed where the go
+# command planned it: a module's in its module cache, which `-trimpath`
+# writes as `PATH@VERSION`, and the module's own under `/work/src`, which
+# it writes as its import path. The files a package embeds are placed with
+# it, and its compile is given the go command's own configuration of what
+# each `//go:embed` pattern matches, as `go build -n` prints it. A package
+# with cgo files, or of a module replaced by a directory, is an error,
+# which says so: neither is built yet.
+import fs
+import json
+import path
+import toolchain
+import Toolchain from toolchain
+
+# Where a step's sandbox has the toolchain, the standard library's
+# archives, the module's own files, and the module proxy.
+let OPT_GO = "/opt/go"
+
+let OPT_STD = "/opt/std"
+
+let SRC = "/work/src"
+
+let PROXY_AT = "/work/proxy"
+
+# The directory of Go's tools for the machine builds run on.
+let TOOLS = "{OPT_GO}/pkg/tool/linux_amd64"
+
+type GoModule = {
+    Path: String,
+    Version: String = "",
+    Main: Bool = false,
+    Dir: String = "",
+    GoVersion: String = "",
+    Replace: {Path: String, Version: String = "", Dir: String = ""} = {Path = ""},
+}
+
+# A package as `go list -json` describes it.
+type GoPackage = {
+    ImportPath: String,
+    Name: String = "",
+    Dir: String = "",
+    Standard: Bool = false,
+    ForTest: String = "",
+    GoFiles: List<String> = [],
+    CgoFiles: List<String> = [],
+    SFiles: List<String> = [],
+    HFiles: List<String> = [],
+    SysoFiles: List<String> = [],
+    EmbedFiles: List<String> = [],
+    Imports: List<String> = [],
+    Deps: List<String> = [],
+    Module: GoModule = {Path = ""},
+}
+
+type GoWorkspace = {
+    src: Dir,
+    go: GoToolchain,
+    proxy: Dir,
+    pins: List<ModuleFile>,
+    goos: String,
+    goarch: String,
+    buildmode: String,
+    tags: List<String>,
+    pack: Dir | Future<Dir>,
+    tree: Dir,
+}
+
+# A test program of a package, with where it runs.
+type GoTest = {name: String, program: File, go: GoToolchain, dir: Dir, at: String}
+
+# What `go` plans of a package: its packages, those its build needs,
+# itself and those of its tests if it plans its tests; the build
+# information `go build` embeds in its program; and the test main `go test`
+# generates for it, if it has tests; the build mode it is planned in; and,
+# by import path, the files each pattern of a package's `//go:embed`
+# matches, as `go build -n` writes them in its embedding configuration, a
+# JSON object.
+type Plan = {
+    packages: List<GoPackage>,
+    modinfo: String,
+    testmain: List<File>,
+    buildmode: String,
+    embeds: List<{package: String, patterns: String}>,
+}
+
+def workspace(
+    src: Dir,
+    sum: File,
+    pinned_by: File,
+    goos: String = "linux",
+    goarch: String = "amd64",
+    buildmode: String = "exe",
+    tags: List<String> = [],
+    ignore: List<String> = ["pekit-out"],
+    go: GoToolchain = toolchain.get(Toolchain::Go),
+) ->> GoWorkspace {
+    let tree = tree_of(src, ignore)
+    = {
+        src = src
+        go = go
+        proxy = proxy(sum, pinned_by)
+        pins = pins(pinned_by)
+        goos = goos
+        goarch = goarch
+        buildmode = buildmode
+        tags = tags
+        pack = pack_built(go)
+        tree = tree
+    }
+}
+
+def bin(ws: GoWorkspace, package: String, name: String = "", ldflags: List<String> = []) -> File {
+    let plan = planned(ws, package, false, ldflags)
+    let roots = for i in 0..len(plan.packages) if plan.packages[i].Name == "main" and not plan.packages[i].Standard {
+        = i
+    }
+    let main = roots[len(roots) - 1]
+    let chosen = if name == "" { path.basename(plan.packages[main].ImportPath) } else { name }
+    let made = built(ws, plan, [main])
+    = linked(ws, plan, made, main, chosen, ["-buildmode={ws.buildmode}", ...ldflags])
+}
+
+def tests(ws: GoWorkspace, package: String) -> List<GoTest> {
+    let plan = planned(ws, package, true, [])
+    let roots = for i in 0..len(plan.packages) if plan.packages[i].ImportPath.ends_with(".test") { = i }
+    if len(roots) == 0 {
+        return []
+    }
+    let main = roots[0]
+    let made = built(ws, plan, [main])
+    let under = plan.packages[main].ImportPath.strip_suffix(".test")
+    let own = for each in plan.packages if each.ImportPath == under { = each }
+    let program = linked(
+        ws,
+        plan,
+        made,
+        main,
+        "{path.basename(under)}.test",
+        ["-s", "-w", "-buildmode=exe", "-X", "testing.testBinary=1"],
+    )
+    = [
+        {
+            name = under
+            program = program
+            go = ws.go
+            dir = dir_of(ws, own[0])
+            at = own[0].Dir
+        },
+    ]
+}
+
+#[hermetic]
+def run_test(
+    test: GoTest,
+    given: List<{at: String, place: Dir | File}> = [],
+    env: List<Entry<String>> = [],
+    args: List<String> = [],
+) -> {} {
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = test.go.runtime},
+        {at = test.at; place = test.dir},
+        {at = "/work/test/{path.basename(test.program.path)}"; place = test.program},
+        ...(for each in given { = {at = each.at; place = each.place} }),
+    ]
+    let box = fs.compose(placed).sandbox(cwd = test.at)
+    let made = box.exec("/bin/mkdir", "-p", "/work/tmp")
+    let ran = box.exec(
+        "/work/test/{path.basename(test.program.path)}",
+        "-test.paniconexit0",
+        "-test.timeout=10m0s",
+        ...args,
+        env = record([{key = "PATH"; value = "/usr/bin:/bin"}, {key = "TMPDIR"; value = "/work/tmp"}, ...env]),
+    )
+}
+
+def vet(ws: GoWorkspace, patterns: List<String> = ["./..."]) -> {} {
+    = vetted(ws.go, ws.tree, ws.proxy, environment_of(ws.goos, ws.goarch, false), build_flags(ws.buildmode, ws.tags), patterns)
+}
+
+def race(
+    ws: GoWorkspace,
+    patterns: List<String> = ["./..."],
+    cc: toolchain.CToolchain = toolchain.get(Toolchain::C),
+) -> {} {
+    = raced(ws.go, cc, ws.tree, ws.proxy, environment_of(ws.goos, ws.goarch, true), ws.tags, patterns)
+}
+
+# --- Planning ---
+
+# The files of the module `src` that its builds read, without the build's
+# outputs, `ignore` at its top, or hidden directories, git's among them:
+# as one directory, so that a step is given only them.
+fn tree_of(src: Dir, ignore: List<String>) ->> Dir {
+    let kept = for each in src.files() {
+        let at = each.path.strip_prefix(src.path).strip_prefix("/")
+        if ignore.contains(at.split("/")[0]) or hidden(at) {
+            continue
+        }
+        = {at = at; place = each}
+    }
+    = composed(kept)
+}
+
+# Whether the path `at` is under a hidden directory, or is a hidden file.
+fn hidden(at: String) -> Bool {
+    if not at.starts_with(".") and not at.contains("/.") {
+        return false
+    }
+    = (for part in at.split("/") if part.starts_with(".") { = part }).len() > 0
+}
+
+# `entries`, each placed at its path, as one directory.
+#[hermetic]
+fn composed(entries: List<{at: String, place: File}>) -> Dir {
+    = fs.compose(for each in entries { = {at = each.at; place = each.place} })
+}
+
+# The environment the go command runs in, in a sandbox that has the
+# toolchain at `/opt/go` and the module proxy at `/work/proxy`: no
+# network, its caches in the step, and nothing of the host's settings.
+fn environment_of(goos: String, goarch: String, cgo: Bool) -> List<Entry<String>> {
+    = [
+        {key = "PATH"; value = "{OPT_GO}/bin:/usr/bin:/bin"},
+        {key = "HOME"; value = "/work/home"},
+        {key = "TMPDIR"; value = "/work/tmp"},
+        {key = "GOROOT"; value = OPT_GO},
+        {key = "GOPATH"; value = "/work/gopath"},
+        {key = "GOMODCACHE"; value = "/work/gopath/pkg/mod"},
+        {key = "GOCACHE"; value = "/work/cache"},
+        {key = "GOPROXY"; value = "file://{PROXY_AT}"},
+        {key = "GOSUMDB"; value = "off"},
+        {key = "GOFLAGS"; value = "-mod=readonly"},
+        {key = "GOTOOLCHAIN"; value = "local"},
+        {key = "GOWORK"; value = "off"},
+        {key = "GOENV"; value = "off"},
+        {key = "GOTELEMETRY"; value = "off"},
+        {key = "CGO_ENABLED"; value = if cgo { "1" } else { "0" }},
+        {key = "GOOS"; value = goos},
+        {key = "GOARCH"; value = goarch},
+    ]
+}
+
+# The go command's flags for a build in `buildmode` with the tags `tags`.
+fn build_flags(buildmode: String, tags: List<String>) -> List<String> {
+    let none: List<String> = []
+    = [
+        "-trimpath",
+        "-buildvcs=false",
+        "-buildmode={buildmode}",
+        ...(if len(tags) > 0 { ["-tags={tags.join(",")}"] } else { none }),
+    ]
+}
+
+# What the go command plans of the package `package`, and of its tests if
+# `test`, its program linked with `ldflags`, which its build information
+# records.
+fn planned(ws: GoWorkspace, package: String, test: Bool, ldflags: List<String>) ->> Plan {
+    let mode = if test { "exe" } else { ws.buildmode }
+    let listed = go_listed(
+        ws.go,
+        ws.tree,
+        ws.proxy,
+        environment_of(ws.goos, ws.goarch, false),
+        build_flags(mode, ws.tags),
+        ldflags,
+        package,
+        test,
+    )
+    let text = listed.file("list.json").read()
+    let pieces = for each in text.split("\n}}\n") if trim(each) != "" { = "{each}\n}}" }
+    let packages = for each in pieces {
+        let decoded: GoPackage = json.decode(each)
+        = decoded
+    }
+    let has_main = (for each in listed.files() if each.path.ends_with("/testmain.go") { = each }).len() > 0
+    let testmain: List<File> = if has_main { [listed.file("testmain.go")] } else { [] }
+    = {
+        packages = packages
+        modinfo = listed.file("modinfo.txt").read()
+        testmain = testmain
+        buildmode = mode
+        embeds = embeds_of(listed.file("n.txt").read())
+    }
+}
+
+# `go list -deps -json` of the package `package`, with `-test` if `test`,
+# in the module `tree`: `list.json`; what `go build -n`, or `go test -n`,
+# prints, `n.txt`; the line of the link's configuration
+# `go build -n`, or `go test -n`, gives its program's build information,
+# with `ldflags`, `modinfo.txt`, empty if it has none; and the test main
+# `go test` generates, `testmain.go`, if it has tests.
+#[hermetic]
+fn go_listed(
+    go: GoToolchain,
+    tree: Dir,
+    proxy: Dir,
+    env: List<Entry<String>>,
+    flags: List<String>,
+    ldflags: List<String>,
+    package: String,
+    test: Bool,
+) -> Dir {
+    let box = go_box(go, tree, proxy, env)
+    let none: List<String> = []
+    let listed = box.exec("{OPT_GO}/bin/go", "list", "-deps", "-json", ...(if test { ["-test"] } else { none }), ...flags, package)
+    # Its own directory, without what the go command writes in the step's,
+    # its caches and its telemetry's counts.
+    let out = "{working_dir().path}/plan"
+    let made = fs.mkdir(out)
+    let wrote = fs.write("{out}/list.json", listed.stdout)
+    let linking = if len(ldflags) > 0 { ["-ldflags={quoted(ldflags)}"] } else { none }
+    let printed = box.exec("{OPT_GO}/bin/go", if test { "test" } else { "build" }, "-n", ...flags, ...linking, package)
+    let printing = fs.write("{out}/n.txt", printed.stderr)
+    let info = for line in lines(printed.stderr) if line.starts_with("modinfo ") { = line }
+    let kept = fs.write("{out}/modinfo.txt", if len(info) > 0 { info[0] } else { "" })
+    if test {
+        let mains = for line in lines(listed.stdout) if line.contains("\"/work/cache/") {
+            = trim(line).strip_suffix(",").strip_prefix("\"").strip_suffix("\"")
+        }
+        if len(mains) > 0 {
+            let copied = box.exec("/bin/cp", mains[0], "/work/testmain.go")
+            let took = fs.copy(box.file("/work/testmain.go").path, "{out}/testmain.go")
+        }
+    }
+    = working_dir().dir("plan")
+}
+
+# The embedding configurations `printed`, what `go build -n` printed,
+# writes: for each package, by its import path, the object of its
+# patterns, `{"name.txt": ["name.txt"]}` say, as the go command writes it.
+# A package's commands follow a heading, `#`, `# PATH` and `#`, and its
+# configuration is written by `cat >.../embedcfg << 'EOF'`, up to `}EOF`.
+fn embeds_of(printed: String) -> List<{package: String, patterns: String}> {
+    let all = lines(printed)
+    let mut found: List<{package: String, patterns: String}> = []
+    let mut current = ""
+    let mut taking = false
+    let mut taken: List<String> = []
+    for i in 0..len(all) {
+        let line = all[i]
+        if taking {
+            if line.ends_with("EOF") {
+                let text = [...taken, line.strip_suffix("EOF")].join("\n")
+                let patterns = text.split("\"Patterns\": ")[1].split(",\n\t\"Files\"")[0]
+                found := [...found, {package = current; patterns = patterns}]
+                taking := false
+                taken := []
+            } else {
+                taken := [...taken, line]
+            }
+        } else if line.starts_with("# ") and i > 0 and all[i - 1] == "#" {
+            current := line.strip_prefix("# ")
+        } else if line.starts_with("cat >") and line.contains("/embedcfg << 'EOF'") {
+            taking := true
+        }
+    }
+    = found
+}
+
+# `text` as a JSON string.
+fn json_string(text: String): String {
+    = "\"{text.split("\\").join("\\\\").split("\"").join("\\\"")}\""
+}
+
+# `words` as the go command reads a flag's list of words: a word with a
+# space or a quote in it in single quotes, or in double ones if it has a
+# single quote. Go's reading has no escapes, so a word with both quotes is
+# an error.
+fn quoted(words: List<String>): String {
+    = (for each in words {
+        let plain = not each.contains(" ") and not each.contains("\"") and not each.contains("'")
+        if plain {
+            = each
+        } else if not each.contains("'") {
+            = "'{each}'"
+        } else if not each.contains("\"") {
+            = "\"{each}\""
+        } else {
+            panic("the linker flag `{each}` has both quotes, which the go command cannot read")
+        }
+    }).join(" ")
+}
+
+# A sandbox of the toolchain's runtime, the toolchain, the module `tree`
+# at `/work/src` and the module proxy `proxy`, in which the go command runs
+# with `env`.
+fn go_box(go: GoToolchain, tree: Dir, proxy: Dir, env: List<Entry<String>>) -> Sandbox {
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+        {at = SRC; place = tree},
+        {at = PROXY_AT; place = proxy},
+    ]
+    let box = fs.compose(placed).sandbox(cwd = SRC, env = record(env))
+    let made = box.exec("/bin/mkdir", "-p", "/work/tmp", "/work/home", "/work/cache")
+    = box
+}
+
+# The standard library, built by the go command with `env` and `flags`,
+# each package's archive at its import path, `fmt.a` say; a package with
+# none, `unsafe` say, which the compiler knows itself, has none here.
+#[hermetic]
+fn std_built(go: GoToolchain, env: List<Entry<String>>, flags: List<String>) -> Dir {
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+    ]
+    let box = fs.compose(placed).sandbox(cwd = "/work", env = record(env))
+    let made = box.exec("/bin/mkdir", "-p", "/work/tmp", "/work/home", "/work/cache", "/work/std")
+    let copied = box.exec(
+        "/bin/sh",
+        "-c",
+        "\"$@\" > /work/std.txt && while read p e; do \
+         [ -z \"$e\" ] && continue; mkdir -p \"/work/std/$(dirname \"$p\")\" && cp \"$e\" \"/work/std/$p.a\" || exit 1; done < /work/std.txt",
+        "sh",
+        "{OPT_GO}/bin/go",
+        "list",
+        "-export",
+        "-f",
+        "{{{{.ImportPath}}}} {{{{.Export}}}}",
+        ...flags,
+        "std",
+    )
+    = box.dir("/work/std")
+}
+
+# Go's `pack`, which adds a package's assembled objects to its archive,
+# built from the toolchain's own source by the go command: a directory of
+# it. The go command packs archives itself, so its distribution has no
+# `pack` of its own.
+#[hermetic]
+fn pack_built(go: GoToolchain) -> Dir {
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+    ]
+    let env = environment_of("linux", "amd64", false)
+    let box = fs.compose(placed).sandbox(cwd = "/work", env = record(env))
+    let made = box.exec("/bin/mkdir", "-p", "/work/tmp", "/work/home", "/work/cache", "/work/out")
+    let built = box.exec("{OPT_GO}/bin/go", "build", "-trimpath", "-o", "/work/out/pack", "cmd/pack")
+    = box.dir("/work/out")
+}
+
+# `go vet` of `patterns` in the module `tree`.
+#[hermetic]
+fn vetted(go: GoToolchain, tree: Dir, proxy: Dir, env: List<Entry<String>>, flags: List<String>, patterns: List<String>) -> {} {
+    let box = go_box(go, tree, proxy, env)
+    let ran = box.exec("{OPT_GO}/bin/go", "vet", ...flags, ...patterns)
+}
+
+# `go test -race` of `patterns` in the module `tree`, with the C toolchain
+# `cc` at `/opt/cc`.
+#[hermetic]
+fn raced(
+    go: GoToolchain,
+    cc: toolchain.CToolchain,
+    tree: Dir,
+    proxy: Dir,
+    env: List<Entry<String>>,
+    tags: List<String>,
+    patterns: List<String>,
+) -> {} {
+    let compiler = "/opt/cc/{cc.cc.path.strip_prefix(cc.root.path).strip_prefix("/")}"
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = cc.runtime},
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+        {at = "/opt/cc"; place = cc.root},
+        {at = SRC; place = tree},
+        {at = PROXY_AT; place = proxy},
+    ]
+    let box = fs.compose(placed).sandbox(cwd = SRC, env = record([...env, {key = "CC"; value = compiler}]))
+    let made = box.exec("/bin/mkdir", "-p", "/work/tmp", "/work/home", "/work/cache")
+    let none: List<String> = []
+    let ran = box.exec(
+        "{OPT_GO}/bin/go",
+        "test",
+        "-race",
+        "-trimpath",
+        "-buildvcs=false",
+        ...(if len(tags) > 0 { ["-tags={tags.join(",")}"] } else { none }),
+        ...patterns,
+    )
+}
+
+# --- Building ---
+
+# What a package came to: the directory of its archive, `pkg.a`.
+type Built = {dir: Dir | Future<Dir>}
+
+# How a package is compiled: its `-p` path; its language version, `go1.26`
+# say; the directory it is compiled in, in the sandbox, and what
+# `-trimpath` writes it as; its files, each placed at its path, and those
+# of them that are Go, assembly and prebuilt objects; and, by the import
+# path its source names, the archive each import is given.
+type CompileSpec = {
+    path: String,
+    lang: String,
+    dir: String,
+    trimmed: String,
+    placed: List<{at: String, place: File}>,
+    go_files: List<String>,
+    s_files: List<String>,
+    syso_files: List<String>,
+    imports: List<{path: String, archive: String}>,
+    embedcfg: String,
+    deps: List<Dir | Future<Dir>>,
+    goos: String,
+    goarch: String,
+    shared: Bool,
+}
+
+# The standard library of `ws`'s configuration in the build mode `mode`.
+fn std_of(ws: GoWorkspace, mode: String) ->> Dir {
+    = std_built(ws.go, environment_of(ws.goos, ws.goarch, false), build_flags(mode, ws.tags))
+}
+
+# What each package of `plan` that the packages `roots` need came to, by
+# its number, built in an order each comes after those it imports; the
+# standard library's, and those not needed, are left as nothing was made of
+# them.
+fn built(ws: GoWorkspace, plan: Plan, roots: List<Int>) ->> List<Built> {
+    let count = len(plan.packages)
+    let ids = for each in plan.packages { = each.ImportPath }
+    let deps = for each in plan.packages {
+        = for i in 0..count if each.Imports.contains(ids[i]) and not plan.packages[i].Standard { = i }
+    }
+    let mut needed = for i in 0..count { = false }
+    let mut pending = roots
+    for len(pending) > 0 {
+        let i = pending[len(pending) - 1]
+        pending := for k in 0..(len(pending) - 1) { = pending[k] }
+        if needed[i] {
+            continue
+        }
+        needed[i] := true
+        pending := [...pending, ...deps[i]]
+    }
+    let nothing: Built = {dir = ws.tree}
+    let mut made = for i in 0..count { = nothing }
+    let mut done = for i in 0..count { = not needed[i] }
+    let mut left = (for i in 0..count if needed[i] { = i }).len()
+    for left > 0 {
+        let mut progressed = false
+        for i in 0..count {
+            if done[i] {
+                continue
+            }
+            let ready = (for dep in deps[i] if not done[dep] { = dep }).len() == 0
+            if not ready {
+                continue
+            }
+            made[i] := {dir = compiled(ws.go, std_of(ws, plan.buildmode), ws.pack, compile_of(ws, plan, made, deps[i], i))}
+            done[i] := true
+            left := left - 1
+            progressed := true
+        }
+        if not progressed {
+            panic("Go's plan has a cycle among its packages")
+        }
+    }
+    = made
+}
+
+# How the package number `i` of `plan` is compiled, the packages it imports,
+# `deps`, built as `made` has them.
+fn compile_of(ws: GoWorkspace, plan: Plan, made: List<Built>, deps: List<Int>, i: Int) -> CompileSpec {
+    let pkg = plan.packages[i]
+    if len(pkg.CgoFiles) > 0 {
+        panic("`{pkg.ImportPath}` has cgo files, which the go library does not build yet")
+    }
+    let plain = pkg.ImportPath.split(" [")[0]
+    let testmain = pkg.ImportPath.ends_with(".test")
+    let source = if testmain { "/work/testmain" } else { pkg.Dir }
+    let files = if testmain {
+        ["_testmain.go"]
+    } else {
+        [...pkg.GoFiles, ...pkg.SFiles, ...pkg.HFiles, ...pkg.SysoFiles, ...pkg.EmbedFiles].unique()
+    }
+    let placed = for each in files {
+        let place: File = if testmain { plan.testmain[0] } else { file_of(ws, pkg, each) }
+        = {at = "{source}/{each}"; place = place}
+    }
+    let ids = for each in plan.packages { = each.ImportPath }
+    # Each import by the path its source names: the package it is, a test's
+    # own variant say, without the variant's `[...]`. Only the standard
+    # library's packages import by paths `ImportMap` maps further, to its
+    # own vendored packages, and the go command builds those. `unsafe` is
+    # the compiler's own, and has no archive.
+    let imports = for id in pkg.Imports if id != "unsafe" {
+        let at = index_in(ids, id)
+        let named = id.split(" [")[0]
+        let archive = if plan.packages[at].Standard { "{OPT_STD}/{named}.a" } else { "{made[at].dir.path}/pkg.a" }
+        = {path = named; archive = archive}
+    }
+    = {
+        path = compiled_as(pkg)
+        lang = lang_of(pkg)
+        dir = source
+        trimmed = trimmed_of(pkg, plain, testmain)
+        placed = placed
+        go_files = if testmain { ["{source}/_testmain.go"] } else { for each in pkg.GoFiles { = "{source}/{each}" } }
+        s_files = pkg.SFiles
+        syso_files = for each in pkg.SysoFiles { = "{source}/{each}" }
+        imports = imports
+        embedcfg = embedcfg_of(plan, pkg, plain, source)
+        deps = for d in deps { = made[d].dir }
+        goos = ws.goos
+        goarch = ws.goarch
+        shared = ["pie", "shared", "c-shared", "plugin"].contains(plan.buildmode)
+    }
+}
+
+# The embedding configuration of the package `pkg`, whose path is `plain`
+# and whose files are at `source`, as the go command writes it: the files
+# each of its patterns matches, as `plan` has them, and where each is; `""`
+# for a package that embeds none.
+fn embedcfg_of(plan: Plan, pkg: GoPackage, plain: String, source: String) -> String {
+    if len(pkg.EmbedFiles) == 0 {
+        return ""
+    }
+    let found = for each in plan.embeds if each.package == plain { = each.patterns }
+    if len(found) == 0 {
+        panic("`{pkg.ImportPath}` embeds files, but the go command wrote no configuration for them")
+    }
+    let files = for each in pkg.EmbedFiles { = "{json_string(each)}: {json_string("{source}/{each}")}" }
+    = "{{\"Patterns\": {found[len(found) - 1]}, \"Files\": {{{files.join(", ")}}}}}"
+}
+
+# The directory of the package `pkg`, with all it holds, its tests' data
+# among it: the module's own, under `src`, or its module's.
+fn dir_of(ws: GoWorkspace, pkg: GoPackage) -> Dir {
+    if pkg.Dir == SRC {
+        return ws.tree
+    }
+    if pkg.Dir.starts_with("{SRC}/") {
+        return ws.src.dir(pkg.Dir.strip_prefix("{SRC}/"))
+    }
+    let module = module_of(pkg)
+    let rel = pkg.Dir.strip_prefix(module.Dir).strip_prefix("/")
+    let root = module_dir(ws, module.Path, module.Version)
+    = if rel == "" { root } else { root.dir(rel) }
+}
+
+# The file `name` of the package `pkg`: the module's own, under `src`, or
+# its module's, fetched by its pin and unpacked.
+fn file_of(ws: GoWorkspace, pkg: GoPackage, name: String) -> File {
+    if pkg.Dir == SRC or pkg.Dir.starts_with("{SRC}/") {
+        let rel = pkg.Dir.strip_prefix(SRC).strip_prefix("/")
+        = ws.src.file(if rel == "" { name } else { "{rel}/{name}" })
+    } else {
+        let module = module_of(pkg)
+        let rel = pkg.Dir.strip_prefix(module.Dir).strip_prefix("/")
+        let root = module_dir(ws, module.Path, module.Version)
+        = root.file(if rel == "" { name } else { "{rel}/{name}" })
+    }
+}
+
+# The module the package `pkg` is built from: its module's replacement, if
+# it has one.
+fn module_of(pkg: GoPackage) -> {Path: String, Version: String, Dir: String} {
+    if pkg.Module.Replace.Path != "" {
+        if pkg.Module.Replace.Version == "" {
+            panic("`{pkg.ImportPath}` is of a module replaced by a directory, which the go library does not build yet")
+        }
+        = {Path = pkg.Module.Replace.Path; Version = pkg.Module.Replace.Version; Dir = pkg.Module.Replace.Dir}
+    } else {
+        = {Path = pkg.Module.Path; Version = pkg.Module.Version; Dir = pkg.Module.Dir}
+    }
+}
+
+# The files of the module `module` at `version`, its zip fetched by its pin
+# and unpacked: the directory `PATH@VERSION` the zip holds.
+fn module_dir(ws: GoWorkspace, module: String, version: String) ->> Dir {
+    = module_source(module_zip(ws.pins, module, version)).dir("{module}@{version}")
+}
+
+# What `-trimpath` writes the directory of the package `pkg`, whose path is
+# `plain`, as: its import path, for the module's own package; `PATH@VERSION`
+# and its directory in the module, for a module's; and nothing for a test
+# main.
+fn trimmed_of(pkg: GoPackage, plain: String, testmain: Bool) -> String {
+    if testmain {
+        return ""
+    }
+    if pkg.Module.Main {
+        return plain
+    }
+    let module = module_of(pkg)
+    let rel = pkg.Dir.strip_prefix(module.Dir)
+    = "{module.Path}@{module.Version}{rel}"
+}
+
+# The path the package `pkg` is compiled as, its `-p`: `main` for a main
+# package, but for a variant of one its tests import, which is compiled as
+# a library, by its import path, as the go command compiles it.
+fn compiled_as(pkg: GoPackage) -> String {
+    = if pkg.Name == "main" and pkg.ForTest == "" { "main" } else { pkg.ImportPath.split(" [")[0] }
+}
+
+# The language version the package `pkg` is compiled for: its module's
+# `go` line, `go1.26` for `go 1.26.1`, or `go1.16` for a module with none,
+# as the go command has it.
+fn lang_of(pkg: GoPackage) -> String {
+    let version = pkg.Module.GoVersion
+    if version == "" {
+        return "go1.16"
+    }
+    let parts = version.split(".")
+    = "go{parts[0]}.{parts[1]}"
+}
+
+# The number of `id` in `ids`, which has it.
+fn index_in(ids: List<String>, id: String) -> Int {
+    for i in 0..len(ids) {
+        if ids[i] == id {
+            return i
+        }
+    }
+    panic("Go's plan names `{id}` but lists no such package")
+}
+
+# The program of the main package number `root` of `plan`, its packages
+# built as `made` has them, named `name` and linked with `flags`.
+fn linked(ws: GoWorkspace, plan: Plan, made: List<Built>, root: Int, name: String, flags: List<String>) -> File {
+    let pkg = plan.packages[root]
+    let ids = for each in plan.packages { = each.ImportPath }
+    # Each package the program holds, by the path it was compiled as, a
+    # test's variant in place of the package it varies.
+    let mut packages: List<{path: String, archive: String}> = []
+    let mut deps: List<Dir | Future<Dir>> = []
+    for id in pkg.Deps if id != "unsafe" {
+        let at = index_in(ids, id)
+        let dep = plan.packages[at]
+        let plain = id.split(" [")[0]
+        if dep.Standard {
+            packages := [...packages, {path = plain; archive = "{OPT_STD}/{plain}.a"}]
+        } else {
+            packages := [...packages, {path = compiled_as(dep); archive = "{made[at].dir.path}/pkg.a"}]
+            deps := [...deps, made[at].dir]
+        }
+    }
+    let program = link(
+        ws.go,
+        std_of(ws, plan.buildmode),
+        {
+            main = "{made[root].dir.path}/pkg.a"
+            packages = packages
+            deps = [...deps, made[root].dir]
+            modinfo = plan.modinfo
+            name = name
+            flags = flags
+        },
+    )
+    = program.file(name)
+}
+
+# --- The steps ---
+
+# The package `spec` says, compiled: a directory of its archive, `pkg.a`.
+#[hermetic]
+fn compiled(go: GoToolchain, std: Dir, pack: Dir, spec: CompileSpec) -> Dir {
+    let config = "{working_dir().path}/importcfg"
+    let wrote = fs.write(config, (for each in spec.imports { = "packagefile {each.path}={each.archive}\n" }).join(""))
+    let embedding = "{working_dir().path}/embedcfg"
+    let embeds = fs.write(embedding, spec.embedcfg)
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+        {at = OPT_STD; place = std},
+        {at = "/opt/pack"; place = pack},
+        {at = "/work/importcfg"; place = file(config)},
+        {at = "/work/embedcfg"; place = file(embedding)},
+        ...(for each in spec.placed { = {at = each.at; place = each.place} }),
+        ...(for each in spec.deps { = {at = each.path; place = each} }),
+    ]
+    let box = fs.compose(placed).sandbox(cwd = spec.dir, env = {PATH = "/usr/bin:/bin"})
+    let made = box.exec("/bin/mkdir", "-p", "/work/out", "/work/obj")
+    let trim = "{spec.dir}=>{spec.trimmed};/work/obj=>"
+    let none: List<String> = []
+    let shared = if spec.shared { ["-shared"] } else { none }
+    let asm_flags = [
+        "-p",
+        spec.path,
+        "-trimpath",
+        trim,
+        "-I",
+        "/work/obj/",
+        "-I",
+        "{OPT_GO}/pkg/include",
+        "-D",
+        "GOOS_{spec.goos}",
+        "-D",
+        "GOARCH_{spec.goarch}",
+        ...shared,
+        ...(if spec.goarch == "amd64" { ["-D", "GOAMD64_v1"] } else { none }),
+    ]
+    let assembly = len(spec.s_files) > 0
+    if assembly {
+        let symbols = box.exec(
+            "{TOOLS}/asm",
+            ...asm_flags,
+            "-gensymabis",
+            "-o",
+            "/work/obj/symabis",
+            ...(for each in spec.s_files { = "./{each}" }),
+        )
+    }
+    let complete = not assembly and len(spec.syso_files) == 0
+    let compiled = box.exec(
+        "{TOOLS}/compile",
+        "-o",
+        "/work/out/pkg.a",
+        "-trimpath",
+        trim,
+        "-p",
+        spec.path,
+        ...(if spec.lang == "" { none } else { ["-lang={spec.lang}"] }),
+        ...(if complete { ["-complete"] } else { none }),
+        ...(if assembly { ["-symabis", "/work/obj/symabis"] } else { none }),
+        "-c=4",
+        ...shared,
+        "-nolocalimports",
+        "-importcfg",
+        "/work/importcfg",
+        ...(if spec.embedcfg == "" { none } else { ["-embedcfg", "/work/embedcfg"] }),
+        "-pack",
+        ...(if assembly { ["-asmhdr", "/work/obj/go_asm.h"] } else { none }),
+        ...spec.go_files,
+    )
+    let objects = for each in spec.s_files {
+        let object = "/work/obj/{path.basename(each).strip_suffix(".s")}.o"
+        let ran = box.exec("{TOOLS}/asm", ...asm_flags, "-o", object, "./{each}")
+        = object
+    }
+    let extra = [...objects, ...spec.syso_files]
+    if len(extra) > 0 {
+        let packed = box.exec("/opt/pack/pack", "r", "/work/out/pkg.a", ...extra)
+    }
+    = box.dir("/work/out")
+}
+
+# The program `spec` says, linked: a directory of it, by its name. Its
+# build ID, which `-B gobuildid` derives its ELF build ID from, is the
+# SHA-256 of what it is linked from, so that it is the same for the same
+# program wherever it is built.
+#[hermetic]
+fn link(
+    go: GoToolchain,
+    std: Dir,
+    spec: {
+        main: String,
+        packages: List<{path: String, archive: String}>,
+        deps: List<Dir | Future<Dir>>,
+        modinfo: String,
+        name: String,
+        flags: List<String>,
+    },
+) -> Dir {
+    let config = "{working_dir().path}/importcfg.link"
+    let none: List<String> = []
+    let lines = [
+        ...(for each in spec.packages { = "packagefile {each.path}={each.archive}\n" }),
+        ...(if spec.modinfo == "" { none } else { ["{spec.modinfo}\n"] }),
+    ]
+    let wrote = fs.write(config, lines.join(""))
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = go.runtime},
+        {at = OPT_GO; place = go.root},
+        {at = OPT_STD; place = std},
+        {at = "/work/importcfg.link"; place = file(config)},
+        ...(for each in spec.deps { = {at = each.path; place = each} }),
+    ]
+    let box = fs.compose(placed).sandbox(cwd = "/work", env = {PATH = "/usr/bin:/bin"; GOROOT = ""})
+    let made = box.exec("/bin/mkdir", "-p", "/work/out")
+    let summed = box.exec(
+        "/bin/sh",
+        "-c",
+        "cat /work/importcfg.link \"$@\" | sha256sum",
+        "sh",
+        spec.main,
+        ...(for each in spec.packages { = each.archive }),
+    )
+    let id = fields(summed.stdout)[0]
+    let ran = box.exec(
+        "{TOOLS}/link",
+        "-o",
+        "/work/out/{spec.name}",
+        "-importcfg",
+        "/work/importcfg.link",
+        "-buildid={id}",
+        ...spec.flags,
+        spec.main,
+    )
+    = box.dir("/work/out")
+}
